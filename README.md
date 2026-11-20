@@ -1,96 +1,60 @@
-Shikkha 📚
+# Shikkha (শিক্ষা)
 
-Shikkha is an Android educational application designed to make learning more accessible and organized for students.
+Android learning app for the Bangladesh NCTB curriculum — practice MCQs, browse the
+question bank, track mistakes, and build toward exams, competition, and video lessons.
 
-✨ Features
+This repository is the **Phase 1-3 foundation** of the master specification: it is a
+real, buildable project covering project setup, Supabase auth with admin-approved
+registration, curriculum browsing, and MCQ practice with offline caching and result
+review. Later phases are tracked in [docs/FEATURE_STATUS.md](docs/FEATURE_STATUS.md).
 
-- Student-focused learning experience
-- Modern Android application structure
-- Kotlin-based development
-- Supabase backend integration
-- Database migrations and seed data
-- Built with Android development best practices
+## Stack
 
-🛠️ Tech Stack
+| Layer | Choice |
+|---|---|
+| Language | Kotlin (JVM 17) |
+| UI | Jetpack Compose, Material 3, primary `#1E88E5` |
+| Architecture | MVVM + Repository |
+| DI | Hilt (KSP) |
+| Async | Coroutines + Flow |
+| Backend | Supabase (Auth, PostgreSQL, RLS, Storage, Realtime) |
+| Local | Room (cache + sync queue), DataStore (settings) |
+| Languages | Bangla + English (`values`, `values-bn`) |
 
-Technology| Purpose
-Kotlin| Main programming language
-Android| Mobile application platform
-Gradle| Build system
-Supabase| Backend and database
-SQL| Database migrations and seed data
+## Module map (Spec 19.2)
 
-📁 Project Structure
+```
+com.shikkha.app
+├── core/          network (Supabase client), database (Room), datastore, common UiState
+├── auth/          registration, login, pending-approval gate   (Spec §2)
+├── dashboard/     student dashboard + PLANNED-feature empty states (Spec §3)
+├── curriculum/    subjects → chapters catalog                  (Spec §4)
+├── mcq/           practice engine, offline cache, result review (Spec §5)
+├── mistakes/      mistake library + retry practice             (Spec §8)
+├── cq/            creative-question browser + model answers    (Spec §6)
+├── profile/       profile view/edit + practice stats           (Spec §15-lite)
+├── settings/      preferences (DataStore)
+├── theme/         Material 3 light/dark
+└── navigation/    single NavHost, session-driven entry point
+```
 
-Shikkha/
-├── app/
-│   └── src/
-│       └── main/
-├── gradle/
-├── README.md
-├── BUILD_GUIDE.md
-├── build.gradle.kts
-├── settings.gradle.kts
-├── gradle.properties
-└── ...
+## Trust boundaries implemented (Spec §22.3)
 
-🚀 Getting Started
+- Approval status, roles, and ownership are enforced by Postgres RLS policies —
+  clients cannot self-approve or read other users' data.
+- Profile writes are restricted by **column privileges**: students can never set
+  `role` or `approval_status`; admins act only through the audited
+  `admin_set_approval()` security-definer function.
+- Unpublished questions are invisible (policy filters `status = 'published'`).
+- Practice attempt ids are client-generated UUIDs, making retries idempotent.
 
-Prerequisites
+## Supabase
 
-- Android Studio
-- Android SDK
-- JDK compatible with the project Gradle configuration
-- A Supabase project (if required by the app configuration)
+- `supabase/migrations/` — run in numeric order from the SQL editor.
+- `supabase/seed/seed_data.sql` — demo catalog + sample MCQs (`source='seed-demo'`).
+  Replace with verified NCTB-aligned content before any release (Spec §4.7).
 
-Installation
+## Getting started
 
-1. Clone the repository:
-   
-   git clone https://github.com/kabbo2514/Shikkha-edu-.git
-
-2. Open the project in Android Studio.
-
-3. Allow Gradle to sync.
-
-4. Configure the required Supabase credentials locally.
-
-5. Build and run the application on an Android device or emulator.
-
-For additional build instructions, see "BUILD_GUIDE.md" (BUILD_GUIDE.md).
-
-🔐 Configuration
-
-Keep API keys, passwords, and other private credentials out of GitHub.
-
-Use local configuration for development secrets. Never expose a Supabase service-role key in an Android application.
-
-🗄️ Database
-
-The project includes Supabase-related database migrations and seed data.
-
-Apply the required migrations to your Supabase project before using backend-dependent features.
-
-🛣️ Roadmap
-
-- [ ] Improve the student learning experience
-- [ ] Expand educational features
-- [ ] Improve UI and usability
-- [ ] Test and optimize application performance
-
-🤝 Contributing
-
-Contributions, suggestions, and bug reports are welcome.
-
-1. Fork the repository.
-2. Create a feature branch.
-3. Make your changes.
-4. Submit a pull request.
-
-📄 License
-
-No license has been specified yet. All rights are reserved by the copyright holder unless a license is added.
-
----
-
-Made with ❤️ for better learning.
+See [BUILD_GUIDE.md](BUILD_GUIDE.md) — prerequisites, first build, backend setup,
+test accounts, and troubleshooting.
