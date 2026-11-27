@@ -1448,7 +1448,7 @@ function seedHistory(S) {
   const raf = (seed) => { let x = hashStr(seed) % 1000; return () => (x = (x * 9301 + 49297) % 233280) / 233280; };
   const subjects = ["math","physics","chemistry","biology","ict","english"];
   S.users.forEach(u => {
-    if (u.role === "admin" || u.status !== "approved") return;
+    if ((u.role && u.role !== "student") || u.status !== "approved") return;
     const rnd = raf(u.id);
     const n = u.id === "u-student" ? 24 : 8;
     for (let i = 0; i < n; i++) {
@@ -1497,7 +1497,7 @@ function seedHistory(S) {
 }
 
 function blankRatings(S) {
-  S.users.forEach(u => { if (u.role !== "admin") S.ratings[u.id] = 1000 + Math.round((u.xp || 0) / 40); });
+  S.users.forEach(u => { if (!u.role || u.role === "student") S.ratings[u.id] = 1000 + Math.round((u.xp || 0) / 40); });
 }
 
 function loadState() {
@@ -1522,6 +1522,8 @@ function normalize() {
   CQS.forEach(c => { if (!DB.cqs.some(x => x.id === c.id)) DB.cqs.push(JSON.parse(JSON.stringify(c))); });
   DB.videos = DB.videos || [];
   VIDEOS.forEach(v => { if (!DB.videos.some(x => x.id === v.id)) DB.videos.push(JSON.parse(JSON.stringify(v))); });
+  // every account needs a role; accounts created before the owner/admin split are students
+  DB.users.forEach(u => { if (!u.role) u.role = "student"; });
 }
 
 function loadDevice() {
@@ -1541,7 +1543,10 @@ function saveDevice() { try { localStorage.setItem(DEVICE_KEY, JSON.stringify(DE
 /* ---------------- selectors ---------------- */
 const userById = id => DB.users.find(u => u.id === id) || null;
 const me = () => userById(DB.currentUserId);
-const isAdmin = () => { const u = me(); return !!(u && u.role === "admin"); };
+const isStaff = u => !!u && (u.role === "admin" || u.role === "owner");
+const isAdmin = () => isStaff(me());
+const isOwner = () => { const u = me(); return !!(u && u.role === "owner"); };
+const roleName = u => !u ? "" : u.role === "owner" ? "Owner" : u.role === "admin" ? "Administrator" : "Student";
 const isApproved = () => { const u = me(); return !!(u && u.status === "approved"); };
 const t = key => (I18N[DEVICE.lang] && I18N[DEVICE.lang][key]) || I18N.en[key] || key;
 const nm = u => u ? (DEVICE.lang === "bn" && u.nameBn ? u.nameBn : u.name) : "Unknown";
@@ -1628,18 +1633,29 @@ function register(data) {
   if (!name || name.trim().length < 3) return { error:"Enter your full name." };
   if (!password || password.length < 6) return { error:"Password must be at least 6 characters." };
   if (password !== confirm) return { error:"Passwords do not match." };
+  /* The very first account on an installation becomes the owner administrator:
+     approved immediately, full console access, and the only role allowed to
+     appoint or remove other administrators. Every later signup waits for review. */
+  const firstAccount = !DB.users.some(x => x.role === "owner");
   const u = {
-    id:uid("u"), email:email.trim(), username:username.trim(), name:name.trim(), role:"student",
-    status:"pending", cls:Number(cls), medium, group, password, hue:hashStr(username) % 360,
-    xp:0, streak:0, videoAccess:false, priv:{ online:true, stats:true },
+    id:uid("u"), email:email.trim(), username:username.trim(), name:name.trim(),
+    role: firstAccount ? "owner" : "student",
+    status: firstAccount ? "approved" : "pending", cls:Number(cls), medium, group, password, hue:hashStr(username) % 360,
+    xp:0, streak:0, videoAccess:firstAccount, priv:{ online:true, stats:true },
     created:new Date().toISOString()
   };
+  if (firstAccount) u.approvedAt = u.created;
   DB.users.push(u);
-  DB.notifications.unshift({ id:uid("n"), userId:"u-admin", type:"pending", title:"New registration", body:`${u.name} · Class ${u.cls} · awaiting approval`, link:"#/admin/approvals", at:new Date().toISOString(), read:false });
-  DB.audit.unshift({ id:uid("a"), at:new Date().toISOString(), actor:"system", action:"registration_created", target:u.email, detail:"Entered pending queue" });
+  if (firstAccount) {
+    notify(u.id, { type:"account", title:"You are the owner administrator", body:"This was the first account on this installation, so it was approved automatically. You can review students and appoint other administrators from the admin console.", link:"#/admin/users" });
+    DB.audit.unshift({ id:uid("a"), at:new Date().toISOString(), actor:"system", action:"owner_bootstrapped", target:u.email, detail:"First account on this installation — auto-approved and granted the owner administrator role" });
+  } else {
+    DB.notifications.unshift({ id:uid("n"), userId:"u-admin", type:"pending", title:"New registration", body:`${u.name} · Class ${u.cls} · awaiting approval`, link:"#/admin/approvals", at:new Date().toISOString(), read:false });
+    DB.audit.unshift({ id:uid("a"), at:new Date().toISOString(), actor:"system", action:"registration_created", target:u.email, detail:"Entered pending queue" });
+  }
   DB.currentUserId = u.id;
   save(true);
-  return { user:u };
+  return { user:u, firstAccount };
 }
 function logout() { DB.currentUserId = null; save(true); }
 
@@ -2015,6 +2031,31 @@ function setAccountStatus(userId, status, note) {
   });
   save(true);
 }
+function setUserRole(userId, role) {
+  const actor = me(), target = userById(userId);
+  if (!actor || !target) return { error:"Account not found." };
+  if (!isOwner()) return { error:"Only the owner account can change administrator roles." };
+  if (target.role === "owner") return { error:"The owner role is permanent." };
+  if (role !== "admin" && role !== "student") return { error:"Unknown role." };
+  if (role === "admin" && target.status !== "approved") return { error:"Approve this account before granting admin access." };
+  target.role = role;
+  if (role === "admin") target.videoAccess = true;
+  const at = new Date().toISOString();
+  DB.audit.unshift({
+    id:uid("a"), at, actor:actor.id,
+    action: role === "admin" ? "admin_role_granted" : "admin_role_revoked",
+    target:target.email,
+    detail: role === "admin" ? "Administrator access granted by the owner" : "Administrator access removed by the owner"
+  });
+  notify(target.id, {
+    type:"account",
+    title: role === "admin" ? "Administrator access granted" : "Administrator access removed",
+    body: role === "admin" ? "The owner appointed you as an administrator. The admin console is now available in your navigation." : "Your account is a standard student account again.",
+    link: role === "admin" ? "#/admin" : "#/dashboard"
+  });
+  save(true);
+  return { ok:true, target, role };
+}
 function addQuestion(data) {
   const q = {
     id:uid("q"), subjectId:data.subjectId, chapterId:data.chapterId, difficulty:data.difficulty || "medium",
@@ -2040,7 +2081,7 @@ function toggleStar(convId) {
 
 /* leaderboard */
 function leaderboard(scope) {
-  let rows = DB.users.filter(u => u.status === "approved" && u.role !== "admin");
+  let rows = DB.users.filter(u => u.status === "approved" && !isStaff(u));
   if (scope === "friends") { const f = friendsOf(DB.currentUserId); rows = rows.filter(u => f.includes(u.id)); }
   rows = rows.map(u => {
     let xp = u.xp || 0;
@@ -2384,6 +2425,9 @@ function authForm(mode) {
       <div class="brandmark" style="width:44px;height:44px;margin-bottom:16px">${icon("sparkles", 22)}</div>
       <h2 class="h1" style="font-size:27px">${isLogin ? (DEVICE.lang === "bn" ? "আবার স্বাগতম" : "Welcome back") : (DEVICE.lang === "bn" ? "অ্যাকাউন্ট তৈরি করুন" : "Create your account")}</h2>
       <p class="muted small" style="margin-top:6px">${isLogin ? (DEVICE.lang === "bn" ? "শেখা চালিয়ে যেতে সাইন ইন করুন।" : "Sign in to continue where you left off.") : esc(t("registerNote"))}</p>
+      ${!isLogin && !DB.users.some(x => x.role === "owner") ? `<div class="row" style="gap:10px;align-items:flex-start;margin-top:12px;padding:11px 13px;border-radius:11px;background:var(--surface-2);border:1px solid var(--line)">
+        <span style="color:var(--violet);display:flex;flex:0 0 auto">${icon("shieldCheck", 16)}</span>
+        <p class="tiny" style="line-height:1.6;margin:0"><b>${DEVICE.lang === "bn" ? "প্রথম অ্যাকাউন্ট · মালিক প্রশাসক" : "First account · owner administrator"}</b><br>${DEVICE.lang === "bn" ? "এই ইনস্টলেশনের প্রথম অ্যাকাউন্টটি স্বয়ংক্রিয়ভাবে অনুমোদিত হবে এবং মালিক প্রশাসক হবে — পরে অন্য প্রশাসক নিয়োগ করতে পারবেন।" : "This is the first account on this installation. It is approved automatically as the owner administrator and can appoint other administrators from the admin console."}</p></div>` : ""}
     </div>
     <div class="auth-tabs" role="tablist">
       <button data-action="auth-tab" data-mode="login" class="${isLogin ? "active" : ""}" role="tab">${esc(t("signIn"))}</button>
@@ -3478,7 +3522,7 @@ function viewFriends() {
   const incoming = DB.friendRequests.filter(r => r.to === u.id && r.status === "pending");
   const outgoing = DB.friendRequests.filter(r => r.from === u.id && r.status === "pending");
   const q = FRIEND_QUERY.trim().toLowerCase();
-  const people = DB.users.filter(x => x.id !== u.id && x.status === "approved" && x.role !== "admin"
+  const people = DB.users.filter(x => x.id !== u.id && x.status === "approved" && !isStaff(x)
     && (!q || x.username.includes(q) || x.name.toLowerCase().includes(q)));
   return {
     active:"friends",
@@ -3728,7 +3772,7 @@ function beginMatch(subjectId, opponentId) {
   const u = me();
   const pool = subjectQuestions(subjectId).slice().sort(() => Math.random() - 0.5).slice(0, 8);
   if (pool.length < 4) { toast(DEVICE.lang === "bn" ? "এই বিষয়ে যথেষ্ট প্রশ্ন নেই।" : "Not enough questions in that subject.", "err"); return; }
-  const opp = userById(opponentId) || DB.users.find(x => x.id !== u.id && x.status === "approved" && x.role !== "admin");
+  const opp = userById(opponentId) || DB.users.find(x => x.id !== u.id && x.status === "approved" && !isStaff(x));
   MATCH = {
     subjectId, opponentId:opp.id, queue:pool.map(q => q.id), index:0, scoreA:0, scoreB:0,
     startedAt:Date.now(), deadline:Date.now() + 5 * 60 * 1000, finished:false,
@@ -4181,6 +4225,7 @@ function viewAdmin(tab) {
       <div class="row wrap" style="gap:10px">
         <div style="flex:1;min-width:220px">
           <div class="row" style="gap:9px"><span class="admin-flag">${icon("shieldCheck", 12)} ${DEVICE.lang === "bn" ? "প্রশাসক" : "Admin console"}</span>
+          ${isOwner() ? `<span class="tag violet">${icon("award", 11)} ${DEVICE.lang === "bn" ? "মালিক" : "Owner"}</span>` : ""}
           <span class="tag grey">${DB.users.filter(u => u.status === "approved").length} ${DEVICE.lang === "bn" ? "অনুমোদিত" : "approved"}</span></div>
           <h1 class="h1" style="margin-top:8px">${esc(t("admin"))}</h1>
           <p class="small muted" style="margin-top:4px">${DEVICE.lang === "bn" ? "সব সিদ্ধান্ত অডিট লগে সংরক্ষিত হয়। মডারেশন ও অ্যাক্সেস পরিবর্তন সার্ভারে প্রয়োগ হয়।" : "Every decision is written to the audit log. Moderation, access and approvals are enforced server-side."}</p>
@@ -4283,21 +4328,41 @@ function adminApprovals() {
 }
 
 function adminUsers() {
-  const rows = DB.users.filter(u => u.role !== "admin");
+  const owner = isOwner();
+  const rows = DB.users.slice().sort((a, b) => {
+    const rank = x => x.role === "owner" ? 0 : x.role === "admin" ? 1 : 2;
+    return rank(a) - rank(b) || String(a.name || "").localeCompare(String(b.name || ""));
+  });
   return `<div class="col" style="gap:14px">
     <div class="card">
-      <div class="card-head"><h2 class="h3">${DEVICE.lang === "bn" ? "সব শিক্ষার্থী" : "All students"}</h2><span class="tiny faint">${rows.length}</span></div>
+      <div class="card-head"><h2 class="h3">${DEVICE.lang === "bn" ? "সব অ্যাকাউন্ট" : "Accounts & administrators"}</h2>
+        <span class="tiny faint">${rows.length} ${DEVICE.lang === "bn" ? "টি অ্যাকাউন্ট" : "accounts"} · ${DB.users.filter(u => isStaff(u)).length} ${DEVICE.lang === "bn" ? "প্রশাসক" : "staff"}</span></div>
       <div class="table-wrap"><table class="table">
-        <thead><tr><th>${DEVICE.lang === "bn" ? "শিক্ষার্থী" : "Student"}</th><th>${esc(t("status"))}</th><th>${esc(t("videoAccess"))}</th><th>XP</th><th></th></tr></thead>
-        <tbody>${rows.map(u => `<tr>
+        <thead><tr><th>${DEVICE.lang === "bn" ? "শিক্ষার্থী" : "Account"}</th><th>${DEVICE.lang === "bn" ? "ভূমিকা" : "Role"}</th><th>${esc(t("status"))}</th><th>${esc(t("videoAccess"))}</th><th>XP</th><th></th></tr></thead>
+        <tbody>${rows.map(u => {
+          const roleTag = u.role === "owner" ? "violet" : u.role === "admin" ? "blue" : "grey";
+          const roleLabel = u.role === "owner" ? (DEVICE.lang === "bn" ? "মালিক" : "Owner") : u.role === "admin" ? (DEVICE.lang === "bn" ? "প্রশাসক" : "Administrator") : (DEVICE.lang === "bn" ? "শিক্ষার্থী" : "Student");
+          return `<tr>
           <td><div class="who">${avatar(u, "sm")}<div><b>${esc(u.name)}</b><span>@${esc(u.username)} · ${esc(t("class"))} ${u.cls}</span></div></div></td>
+          <td><span class="tag ${roleTag}">${u.role === "owner" ? icon("award", 10) + " " : ""}${roleLabel}</span></td>
           <td><span class="tag ${u.status === "approved" ? "green" : u.status === "pending" ? "amber" : "rose"}">${esc(u.status)}</span></td>
           <td><button class="toggle ${u.videoAccess ? "on" : ""}" data-action="toggle-video-access" data-id="${u.id}" aria-label="${esc(t("videoAccess"))}" aria-pressed="${!!u.videoAccess}"></button></td>
           <td class="num">${fmtNum(u.xp)}</td>
           <td><div class="row" style="gap:5px;justify-content:flex-end">
-            ${u.status === "approved" ? `<button class="btn btn-sm btn-ghost" data-action="suspend-user" data-id="${u.id}">${esc(t("suspend"))}</button>` : u.status === "suspended" ? `<button class="btn btn-sm btn-ghost" data-action="approve-user" data-id="${u.id}">${DEVICE.lang === "bn" ? "পুনরুদ্ধার" : "Reactivate"}</button>` : ""}
-            <button class="btn btn-sm btn-ghost" data-action="wipe-user" data-id="${u.id}" aria-label="Reset">${icon("trash", 14)}</button></div></td></tr>`).join("")}</tbody>
+            ${owner && u.role !== "owner" ? (u.role === "admin"
+              ? `<button class="btn btn-sm btn-ghost" data-action="demote-admin" data-id="${u.id}">${DEVICE.lang === "bn" ? "অ্যাডমিন সরান" : "Remove admin"}</button>`
+              : `<button class="btn btn-sm btn-soft" data-action="promote-admin" data-id="${u.id}"${u.status !== "approved" ? " disabled" : ""}>${icon("shieldCheck", 13)} ${DEVICE.lang === "bn" ? "অ্যাডমিন করুন" : "Make admin"}</button>`) : ""}
+            ${u.role === "owner" ? `<span class="tiny faint">${DEVICE.lang === "bn" ? "প্রথম অ্যাকাউন্ট" : "First account"}</span>` : ""}
+            ${u.status === "approved" && u.role !== "owner" ? `<button class="btn btn-sm btn-ghost" data-action="suspend-user" data-id="${u.id}">${esc(t("suspend"))}</button>` : u.status === "suspended" ? `<button class="btn btn-sm btn-ghost" data-action="approve-user" data-id="${u.id}">${DEVICE.lang === "bn" ? "পুনরুদ্ধার" : "Reactivate"}</button>` : ""}
+            ${u.role === "owner" ? "" : `<button class="btn btn-sm btn-ghost" data-action="wipe-user" data-id="${u.id}" aria-label="Reset">${icon("trash", 14)}</button>`}</div></td></tr>`;
+        }).join("")}</tbody>
       </table></div>
+      <div class="card-pad" style="border-top:1px solid var(--line)">
+        <div class="row" style="gap:9px;align-items:flex-start"><span class="stat-ico">${icon("shieldCheck", 16)}</span>
+          <p class="tiny faint" style="line-height:1.6">${owner
+            ? (DEVICE.lang === "bn" ? "মালিক হিসেবে আপনি যেকোনো অনুমোদিত শিক্ষার্থীকে প্রশাসক বানাতে বা সরাতে পারেন। প্রতিটি পরিবর্তন অডিট লগে লেখা হয়। মালিকের ভূমিকা কখনো বদলানো যায় না।" : "As owner you can appoint any approved account as an administrator, or remove that access again. Every change is written to the audit log. The owner role itself can never be reassigned or removed.")
+            : (DEVICE.lang === "bn" ? "শুধু মালিক (প্রথম অ্যাকাউন্ট) প্রশাসকের ভূমিকা বদলাতে পারেন।" : "Only the owner account — the first account created on this installation — can appoint or remove administrators.")}</p></div>
+      </div>
     </div>
     <div class="card">
       <div class="card-head"><h2 class="h3">${DEVICE.lang === "bn" ? "ভিডিও অ্যাক্সেস অডিট" : "Video access audit"}</h2><span class="tag grey">${DB.videoGrants.length}</span></div>
@@ -4477,7 +4542,7 @@ function viewProfile() {
               <h1 class="h2" style="font-size:22px">${esc(nm(u))}</h1>
               <p class="small muted">@${esc(u.username)} · ${esc(t("class"))} ${u.cls} · ${esc(u.medium === "bangla" ? t("bangla") : t("english"))} · ${esc(u.group)}</p>
               <div class="row wrap" style="gap:6px;margin-top:7px">
-                <span class="tag ${u.role === "admin" ? "violet" : "green"}">${u.role === "admin" ? "Administrator" : esc(t("approved"))}</span>
+                <span class="tag ${isStaff(u) ? "violet" : "green"}">${u.role === "owner" ? (DEVICE.lang === "bn" ? "মালিক · প্রশাসক" : "Owner · Administrator") : u.role === "admin" ? (DEVICE.lang === "bn" ? "প্রশাসক" : "Administrator") : esc(t("approved"))}</span>
                 <span class="tag amber">${icon("flame", 11)} ${u.streak || 0} ${esc(t("streak"))}</span>
                 <span class="tag grey">${esc(league.name[DEVICE.lang])}</span>
                 <span class="tag grey">${DEVICE.lang === "bn" ? "যোগ দিয়েছেন" : "Joined"} ${joined}</span>
@@ -4640,7 +4705,7 @@ function navigate(hash) {
 function resolveView() {
   const u = me();
   if (!u) return viewAuth();
-  if (u.status !== "approved" && u.role !== "admin") return viewPending();
+  if (u.status !== "approved" && !isStaff(u)) return viewPending();
   const { path, query } = CURRENT;
   const [root, a, b] = path;
   if (!root || root === "dashboard") return viewDashboard();
@@ -5242,7 +5307,7 @@ document.addEventListener("click", e => {
     case "quick-match": {
       const sel = document.getElementById("matchSubject");
       const subjectId = sel ? sel.value : "math";
-      const pool = DB.users.filter(x => x.id !== DB.currentUserId && x.status === "approved" && x.role !== "admin");
+      const pool = DB.users.filter(x => x.id !== DB.currentUserId && x.status === "approved" && !isStaff(x));
       const opp = pool[Math.floor(Math.random() * pool.length)] || DB.users[1];
       beginMatch(subjectId, opp.id);
       break;
@@ -5323,7 +5388,7 @@ document.addEventListener("click", e => {
       const body = (document.getElementById("anBody") || {}).value || "";
       const audience = (document.getElementById("anAudience") || {}).value || "all";
       if (!title.trim() || !body.trim()) { toast("Add a title and message.", "err"); break; }
-      const targets = DB.users.filter(x => x.status === "approved" && (audience === "all" || x.role !== "admin"));
+      const targets = DB.users.filter(x => x.status === "approved" && (audience === "all" || !isStaff(x)));
       targets.forEach(x => notify(x.id, { type:"info", title:title.trim(), body:body.trim(), link:"#/notifications" }));
       DB.announcements.unshift({ id:uid("an"), title:title.trim(), body:body.trim(), audience, at:new Date().toISOString(), by:DB.currentUserId });
       DB.audit.unshift({ id:uid("a"), at:new Date().toISOString(), actor:DB.currentUserId, action:"announcement_sent", target:title.trim(), detail:`${targets.length} recipients` });
@@ -5333,6 +5398,29 @@ document.addEventListener("click", e => {
     case "approve-user": {
       setAccountStatus(id, "approved");
       toast("Account approved"); render(); break;
+    }
+    case "promote-admin": {
+      const res = setUserRole(id, "admin");
+      if (res.error) { toast(res.error, "err"); break; }
+      render();
+      toast(`${res.target.name} is now an administrator`);
+      break;
+    }
+    case "demote-admin": {
+      const u = userById(id);
+      openModal(`<div class="modal-head"><div class="grow"><h2 class="h2">Remove administrator access?</h2>
+        <p class="small muted" style="margin-top:4px">${esc(nm(u))} keeps the account and all progress but loses the admin console.</p></div></div>
+        <div class="modal-foot"><button class="btn btn-ghost" data-action="close-modal">${esc(t("cancel"))}</button>
+        <button class="btn btn-danger" data-action="confirm-demote" data-id="${id}">${DEVICE.lang === "bn" ? "অ্যাডমিন সরান" : "Remove admin"}</button></div>`, { label:"Remove administrator" });
+      break;
+    }
+    case "confirm-demote": {
+      const res = setUserRole(el.dataset.id, "student");
+      closeModal();
+      if (res.error) { toast(res.error, "err"); break; }
+      render();
+      toast(`${res.target.name} is now a student account`);
+      break;
     }
     case "reject-user": {
       openModal(`<div class="modal-head"><div class="grow"><h2 class="h2">Reject registration</h2>
@@ -5495,7 +5583,12 @@ document.addEventListener("submit", e => {
       });
       if (res.error) return fail(res.error);
       render();
-      toast("Account created — awaiting administrator approval");
+      if (res.firstAccount) {
+        location.hash = "#/dashboard";
+        toast("Owner account created — you are signed in as administrator");
+      } else {
+        toast("Account created — awaiting administrator approval");
+      }
     }
   }
 });
@@ -5525,7 +5618,7 @@ function renderSearchResults(query) {
   DB.questions.filter(x => q && (x.en.q.toLowerCase().includes(q) || (x.bn && x.bn.q.includes(q)))).slice(0, 4).forEach(x => {
     out.push({ href:`#/practice/${x.chapterId}`, icon:"practice", title:qText(x).q.slice(0, 70), sub:chapName(chapterOf(x.chapterId)) });
   });
-  DB.users.filter(x => q && (x.username.includes(q) || x.name.toLowerCase().includes(q)) && x.role !== "admin").slice(0, 3).forEach(x => {
+  DB.users.filter(x => q && (x.username.includes(q) || x.name.toLowerCase().includes(q)) && !isStaff(x)).slice(0, 3).forEach(x => {
     out.push({ href:`#/friends`, icon:"users", title:x.name, sub:"@" + x.username });
   });
   box.innerHTML = out.length ? out.map(o => `<a class="list-item" href="${o.href}" data-action="close-modal" style="border:1px solid var(--line);border-radius:10px">
@@ -5665,10 +5758,10 @@ window.addEventListener("hashchange", () => {
   CURRENT = parseHash();
   const u = me();
   if (!location.hash) {
-    location.replace("#/" + (u ? (u.status === "approved" || u.role === "admin" ? "dashboard" : "pending") : ""));
+    location.replace("#/" + (u ? (u.status === "approved" || isStaff(u) ? "dashboard" : "pending") : ""));
   }
   render();
-  if (u && (u.status === "approved" || u.role === "admin")) {
+  if (u && (u.status === "approved" || isStaff(u))) {
     setTimeout(() => {
       if (CURRENT.path[0] === "dashboard" && DB.friendRequests.some(r => r.to === u.id && r.status === "pending")) {
         /* subtle second signal beyond the bell badge */
